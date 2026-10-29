@@ -1,0 +1,15 @@
+# Arduino & C/C++ compilation artifacts
+*.hex
+*.elf
+*.bin
+*.o
+*.d
+build/
+.build/
+
+# Editor & OS files
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+Desktop.ini
