@@ -3,17 +3,18 @@
  * UNIT       : TIM IRADIATOR - PROGRAMMER
  * FILE       : ESP32_Indoor_Monitor.ino
  * BOARD      : ESP32 Dev Module
- * DESKRIPSI  : Membaca sensor Detektor Geiger-Müller (GM) & DHT22 di dalam ruang
- *              radiasi instalasi, mengontrol Relay Alarm keselamatan (Fail-Safe),
- *              dan mengirim data terurut (Sequence) ke Server Web Laravel.
+ * DESKRIPSI  : Membaca sensor Detektor Geiger-Müller (GM Kit) & Sensor Tekanan/Suhu
+ *              BMP280 (I2C) di dalam ruang radiasi instalasi, mengontrol Relay Alarm
+ *              keselamatan (Fail-Safe), dan mengirim data terurut ke Server Web Laravel.
  * ==============================================================================
  * PANDUAN WIRING PIN (ESP32):
  * ------------------------------------------------------------------------------
  * KOMPONEN               PIN ESP32         KETERANGAN
- * Detektor GM (Pulse)    GPIO 12           Interrupt pulsa radiasi (Active LOW)
- * Sensor DHT22 (Data)    GPIO 15           Sensor suhu & kelembapan
+ * GM Kit (Pulse / Out)   GPIO 12           Interrupt pulsa radiasi (Active LOW)
+ * Sensor BMP280 (SDA)    GPIO 21           I2C Serial Data
+ * Sensor BMP280 (SCL)    GPIO 22           I2C Serial Clock
  * Modul Relay Alarm      GPIO 26           Kontrol sirene / interlock keselamatan
- * VCC Komponen           5V / 3.3V         Sesuai spesifikasi modul
+ * VCC Komponen           3.3V / 5V         Sesuai spesifikasi modul
  * GND                    GND               Wajib satu common ground
  * ==============================================================================
  */
@@ -21,7 +22,8 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <HTTPClient.h>
-#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
 #include <ArduinoJson.h>
 
 // ==============================================================================
@@ -39,9 +41,7 @@ const char* API_KEY       = "radiation_monitor_secret_key";
 // ==============================================================================
 // 2. KONFIGURASI HARDWARE & AMBANG BATAS SAFETY
 // ==============================================================================
-#define GM_PIN         12     // Pin interrupt pulsa GM
-#define DHTPIN         15     // Pin data DHT22
-#define DHTTYPE        DHT22
+#define GM_PIN         12     // Pin interrupt pulsa GM Kit
 #define RELAY_PIN      26     // Pin modul relay alarm / sirene
 
 // Batas aman radiasi ruang instalasi (10 uSv/jam)
@@ -51,7 +51,7 @@ const char* API_KEY       = "radiation_monitor_secret_key";
 #define MAX_PERIOD     60000  // Skala 1 menit (60 detik)
 #define SEND_INTERVAL  5000   // Interval kirim data (5 detik)
 
-DHT dht(DHTPIN, DHTTYPE);
+Adafruit_BMP280 bmp; // Objek sensor BMP280 (I2C SDA: GPIO 21, SCL: GPIO 22)
 
 // Variabel data radiasi & transmisi
 volatile unsigned long counts = 0;
@@ -63,13 +63,14 @@ unsigned long seqNumber       = 1;   // Nomor urut paket data
 double doseRate               = 0.0;
 String relayStatus            = "ON"; // ON = Kondisi Aman, OFF = Terpicu Alarm Bahaya
 
-// Interrupt Service Routine (ISR) pulsa GM
+// Interrupt Service Routine (ISR) pulsa GM Kit
 void IRAM_ATTR impulse() {
   counts++;
 }
 
 // Konversi CPM ke laju dosis (uSv/jam)
 double Sieverts(double cpm) {
+  // Faktor kalibrasi standar tabung GM (J305 / M4011)
   return cpm * 0.00571;
 }
 
@@ -82,9 +83,20 @@ void setup() {
   Serial.begin(115200);
   multiplier = MAX_PERIOD / LOG_PERIOD;
 
-  // Inisialisasi Sensor & Relay
-  dht.begin();
-  pinMode(DHTPIN, INPUT);
+  // Inisialisasi I2C & BMP280
+  Wire.begin(21, 22);
+  bool bmpStatus = bmp.begin(0x76); // Coba alamat I2C default 0x76
+  if (!bmpStatus) {
+    bmpStatus = bmp.begin(0x77);    // Fallback ke alamat 0x77
+  }
+
+  if (!bmpStatus) {
+    Serial.println("Peringatan: Sensor BMP280 tidak terdeteksi! Periksa sambungan SDA (21) & SCL (22).");
+  } else {
+    Serial.println("Sensor BMP280 berhasil diinisialisasi.");
+  }
+
+  // Inisialisasi GM Kit & Relay
   pinMode(GM_PIN, INPUT);
   pinMode(RELAY_PIN, OUTPUT);
 
@@ -110,17 +122,16 @@ void setup() {
 }
 
 void loop() {
-  // 1. Pembacaan Sensor Lingkungan DHT22
-  double kelembaban = dht.readHumidity();
-  double suhu       = dht.readTemperature();
+  // 1. Pembacaan Sensor BMP280 (Suhu & Tekanan Udara)
+  double suhu = bmp.readTemperature();
+  double tekananHpa = bmp.readPressure() / 100.0F; // Tekanan dalam hPa
 
-  if (isnan(kelembaban) || isnan(suhu)) {
-    Serial.println("Peringatan: Gagal membaca sensor DHT22 Indoor!");
-    delay(1000);
-    return;
+  if (isnan(suhu)) {
+    suhu = 0.0;
+    Serial.println("Gagal membaca suhu dari BMP280!");
   }
 
-  // 2. Kalkulasi Laju Dosis & Logika Proteksi Safety Alarm
+  // 2. Kalkulasi Laju Dosis GM Kit & Logika Proteksi Safety Alarm
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis > LOG_PERIOD) {
     previousMillis = currentMillis;
@@ -152,14 +163,15 @@ void loop() {
       http.addHeader("Api-Key", API_KEY);
 
       // Siapkan payload JSON sesuai dokumentasi esp32-api.md
+      // Catatan: BMP280 membaca Suhu & Tekanan. Nilai kelembapan diisi 0.0 atau tekanan hPa
       StaticJsonDocument<384> doc;
       doc["seq"]        = seqNumber++;
       doc["cps"]        = counts;
       doc["usvh"]       = round2(doseRate);
       doc["suhu"]       = round2(suhu);
-      doc["kelembapan"] = round2(kelembaban);
+      doc["kelembapan"] = round2(tekananHpa); // Dapat dialokasikan untuk data tekanan atmosfer (hPa)
       doc["relay"]      = relayStatus;
-      doc["jaringan"]   = "WiFi"; // Ubah jadi "LoRa" jika melalui modul LoRa
+      doc["jaringan"]   = "WiFi";             // "LoRa" jika melalui modul LoRa
       doc["rssi"]       = WiFi.RSSI();
 
       String requestBody;
@@ -168,8 +180,8 @@ void loop() {
       int httpResponseCode = http.POST(requestBody);
 
       if (httpResponseCode > 0) {
-        Serial.printf("[POST INDOOR #%lu] HTTP %d | Dosis: %.2f uSv/h | Suhu: %.1f C | Relay: %s | RSSI: %d dBm\n",
-                      seqNumber - 1, httpResponseCode, doseRate, suhu, relayStatus.c_str(), WiFi.RSSI());
+        Serial.printf("[POST INDOOR #%lu] HTTP %d | Dosis: %.2f uSv/h | Suhu: %.1f C | Tekanan: %.1f hPa | Relay: %s\n",
+                      seqNumber - 1, httpResponseCode, doseRate, suhu, tekananHpa, relayStatus.c_str());
       } else {
         Serial.printf("[POST INDOOR ERROR] %s\n", http.errorToString(httpResponseCode).c_str());
       }

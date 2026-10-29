@@ -4,22 +4,20 @@
  * FILE       : ESP32_Master_Display.ino
  * BOARD      : ESP32 Dev Module
  * DESKRIPSI  : Master Gateway & Display HMI Nextion TFT LCD.
- *              Mengambil data monitoring area dalam dari server via HTTP GET,
- *              mengirimkan data outdoor via HTTP POST, dan memperbarui seluruh
- *              parameter pembacaan (Suhu, Kelembapan, Laju Dosis, Status Bahaya)
- *              ke layar LCD Nextion secara real-time.
+ *              Dilengkapi sensor lokal GM Kit & DHT22, mengambil data indoor dari
+ *              server via HTTP GET, mengirimkan data outdoor via HTTP POST, dan
+ *              memperbarui seluruh parameter pembacaan (Suhu, Kelembapan, Laju Dosis,
+ *              Status Bahaya) ke layar LCD Nextion secara real-time.
  * ==============================================================================
- * PANDUAN WIRING PIN (ESP32 ke Nextion HMI):
+ * PANDUAN WIRING PIN (ESP32):
  * ------------------------------------------------------------------------------
- * NEXTION HMI          ESP32               KETERANGAN
- * +5V                  5V (VIN)            Daya modul (Disarankan adaptor eksternal)
- * GND                  GND                 Wajib satu ground
- * TX                   RX0 (GPIO 3)        Atau Serial2 RX2 (GPIO 16)
- * RX                   TX0 (GPIO 1)        Atau Serial2 TX2 (GPIO 17)
- * ------------------------------------------------------------------------------
- * SENSOR LOKAL (Opsional):
- * Detektor GM (Pulse)  GPIO 12             Interrupt pulsa radiasi luar
- * Sensor DHT22 (Data)  GPIO 15             Suhu & kelembapan ruang kontrol
+ * KOMPONEN               PIN ESP32         KETERANGAN
+ * Layar Nextion TX       RX0 (GPIO 3)      Atau Serial2 RX2 (GPIO 16)
+ * Layar Nextion RX       TX0 (GPIO 1)      Atau Serial2 TX2 (GPIO 17)
+ * GM Kit (Pulse / VIN)   GPIO 12           Interrupt pulsa radiasi (Active LOW)
+ * Sensor DHT22 (Data)    GPIO 15           Sensor suhu & kelembapan lokal
+ * VCC Komponen           5V / 3.3V         Nextion disarankan 5V eksternal
+ * GND                    GND               Wajib satu common ground
  * ==============================================================================
  */
 
@@ -45,7 +43,7 @@ const char* API_KEY         = "radiation_monitor_secret_key";
 // ==============================================================================
 // 2. KONFIGURASI HARDWARE & DISPLAY
 // ==============================================================================
-#define GM_PIN           12     // Pin GM Tube luar
+#define GM_PIN           12     // Pin GM Kit luar (Interrupt)
 #define DHTPIN           15     // Pin DHT22 ruang kontrol
 #define DHTTYPE          DHT22
 
@@ -58,7 +56,7 @@ const char* API_KEY         = "radiation_monitor_secret_key";
 
 DHT dht(DHTPIN, DHTTYPE);
 
-// Variabel sensor lokal (Luar)
+// Variabel GM Kit lokal (Luar)
 volatile unsigned long counts = 0;
 unsigned long previousMillis  = 0;
 unsigned long lastUpdateTime  = 0;
@@ -70,7 +68,7 @@ double suhuDalam       = 0.0;
 double kelembapanDalam = 0.0;
 double doseRateDalam   = 0.0;
 
-// Interrupt Service Routine pulsa GM
+// Interrupt Service Routine pulsa GM Kit
 void IRAM_ATTR impulse() {
   counts++;
 }
@@ -140,7 +138,7 @@ void loop() {
     suhuLuar       = 0.0;
   }
 
-  // 2. Hitung Laju Radiasi Lokal Berkala
+  // 2. Hitung Laju Radiasi GM Kit Berkala
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis > LOG_PERIOD) {
     previousMillis = currentMillis;

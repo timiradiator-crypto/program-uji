@@ -3,14 +3,14 @@
  * UNIT       : TIM IRADIATOR - PROGRAMMER
  * FILE       : ESP32_Outdoor_Monitor.ino
  * BOARD      : ESP32 Dev Module
- * DESKRIPSI  : Membaca sensor Detektor Geiger-Müller (GM) dan DHT22 di area luar
+ * DESKRIPSI  : Membaca sensor Detektor Geiger-Müller Kit (GM Kit) dan DHT22 di area luar
  *              (outdoor/ruang operator), menghitung laju dosis radiasi latar,
  *              dan mengirim data via HTTP POST ke Server Web Laravel.
  * ==============================================================================
  * PANDUAN WIRING PIN (ESP32):
  * ------------------------------------------------------------------------------
  * KOMPONEN               PIN ESP32         KETERANGAN
- * Detektor GM (Pulse)    GPIO 12           Interrupt pulsa radiasi (Active LOW)
+ * GM Kit (Pulse / VIN)   GPIO 12           Interrupt pulsa radiasi (Active LOW)
  * Sensor DHT22 (Data)    GPIO 15           Sensor suhu & kelembapan
  * VCC Komponen           5V / 3.3V         Sesuai spesifikasi modul
  * GND                    GND               Wajib satu common ground
@@ -38,7 +38,7 @@ const char* API_KEY       = "radiation_monitor_secret_key";
 // ==============================================================================
 // 2. KONFIGURASI PERANGKAT KERAS & SAMPLING
 // ==============================================================================
-#define GM_PIN         12     // Pin interrupt pulsa tabung GM
+#define GM_PIN         12     // Pin interrupt pulsa GM Kit
 #define DHTPIN         15     // Pin data DHT22
 #define DHTTYPE        DHT22
 
@@ -48,7 +48,7 @@ const char* API_KEY       = "radiation_monitor_secret_key";
 
 DHT dht(DHTPIN, DHTTYPE);
 
-// Variabel kalkulasi radiasi
+// Variabel kalkulasi radiasi GM Kit
 volatile unsigned long counts = 0;
 unsigned long previousMillis  = 0;
 unsigned long lastSendTime    = 0;
@@ -59,7 +59,7 @@ int currentCPM = 0;
 double doseRate = 0.0;
 double pencacahanArray[100];
 
-// Interrupt Service Routine (ISR) untuk mencacah pulsa GM
+// Interrupt Service Routine (ISR) untuk mencacah pulsa GM Kit
 void IRAM_ATTR impulse() {
   counts++;
 }
@@ -79,7 +79,7 @@ void setup() {
   Serial.begin(115200);
   multiplier = MAX_PERIOD / LOG_PERIOD;
 
-  // Inisialisasi Sensor & Interrupt
+  // Inisialisasi Sensor & Interrupt GM Kit
   dht.begin();
   pinMode(DHTPIN, INPUT);
   pinMode(GM_PIN, INPUT);
@@ -112,7 +112,7 @@ void loop() {
     return;
   }
 
-  // 2. Kalkulasi CPM & Laju Dosis Radiasi Tiap 30 Detik
+  // 2. Kalkulasi CPM & Laju Dosis Radiasi GM Kit Tiap 30 Detik
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis > LOG_PERIOD) {
     previousMillis = currentMillis;
@@ -127,7 +127,7 @@ void loop() {
     }
     rerataCPM /= (currentCPM + 1);
 
-    Serial.printf("[UPDATE RADIASI] CPM: %.1f | Laju Dosis: %.4f uSv/h\n", rerataCPM, doseRate);
+    Serial.printf("[UPDATE GM KIT] CPM: %.1f | Laju Dosis: %.4f uSv/h\n", rerataCPM, doseRate);
     currentCPM++;
     if (currentCPM >= 100) currentCPM = 0;
   }
