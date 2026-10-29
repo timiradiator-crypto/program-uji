@@ -3,74 +3,67 @@
  * UNIT       : TIM IRADIATOR - PROGRAMMER
  * FILE       : ESP32_Outdoor_Monitor.ino
  * BOARD      : ESP32 Dev Module
- * DESKRIPSI  : Membaca sensor Detektor Geiger-Müller Kit (GM Kit) dan DHT22 di area luar
- *              (outdoor/ruang operator), menghitung laju dosis radiasi latar,
- *              dan mengirim data via HTTP POST ke Server Web Laravel.
+ * DESKRIPSI  : Node Outdoor (Luar Ruangan). Membaca GM Kit dan DHT22.
+ *              Karena terhalang dinding tebal tanpa sinyal WiFi, data dikirim
+ *              langsung ke Master Display menggunakan MODUL LORA (SX1278).
  * ==============================================================================
  * PANDUAN WIRING PIN (ESP32):
  * ------------------------------------------------------------------------------
  * KOMPONEN               PIN ESP32         KETERANGAN
- * GM Kit (Pulse / VIN)   GPIO 12           Interrupt pulsa radiasi (Active LOW)
- * Sensor DHT22 (Data)    GPIO 15           Sensor suhu & kelembapan
- * VCC Komponen           5V / 3.3V         Sesuai spesifikasi modul
+ * Modul LoRa SCK         GPIO 18           SPI Clock
+ * Modul LoRa MISO        GPIO 19           SPI MISO
+ * Modul LoRa MOSI        GPIO 23           SPI MOSI
+ * Modul LoRa NSS / CS    GPIO 5            SPI Chip Select
+ * Modul LoRa RST         GPIO 14           Reset Pin
+ * Modul LoRa DIO0        GPIO 2            Interrupt Pin LoRa
+ * ------------------------------------------------------------------------------
+ * GM Kit (Pulse / Out)   GPIO 12           Interrupt pulsa radiasi (Active LOW)
+ * Sensor DHT22 (Data)    GPIO 15           Sensor suhu & kelembapan luar
+ * VCC                    3.3V / 5V         LoRa wajib 3.3V!
  * GND                    GND               Wajib satu common ground
  * ==============================================================================
  */
 
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <HTTPClient.h>
+#include <SPI.h>
+#include <LoRa.h>
 #include <DHT.h>
 #include <ArduinoJson.h>
 
 // ==============================================================================
-// 1. KONFIGURASI JARINGAN & SERVER API
+// 1. KONFIGURASI LORA & SAMPLING
 // ==============================================================================
-const char* WIFI_SSID     = "NAMA_WIFI_ANDA";
-const char* WIFI_PASSWORD = "PASSWORD_WIFI_ANDA";
+#define LORA_BAND      433E6   // Frekuensi LoRa: 433E6 (433MHz) atau 915E6 (915MHz)
+#define LORA_SS        5       // GPIO 5 (NSS/CS)
+#define LORA_RST       14      // GPIO 14 (RST)
+#define LORA_DIO0      2       // GPIO 2 (DIO0)
 
-// Endpoint API server Laravel untuk monitor luar
-const char* SERVER_POST   = "http://192.168.1.100:8000/api/store-data-outdoor-monitor";
-
-// API Key wajib sama dengan konfigurasi di file .env server
-const char* API_KEY       = "radiation_monitor_secret_key";
-
-// ==============================================================================
-// 2. KONFIGURASI PERANGKAT KERAS & SAMPLING
-// ==============================================================================
-#define GM_PIN         12     // Pin interrupt pulsa GM Kit
-#define DHTPIN         15     // Pin data DHT22
+#define GM_PIN         12      // Pin pulsa GM Kit
+#define DHTPIN         15      // Pin data DHT22
 #define DHTTYPE        DHT22
 
-#define LOG_PERIOD     30000  // Periode hitung laju dosis (30 detik)
-#define MAX_PERIOD     60000  // Skala 1 menit (60 detik) untuk konversi CPM
-#define SEND_INTERVAL  5000   // Interval pengiriman HTTP POST (5 detik)
+#define LOG_PERIOD     30000   // Sampling laju dosis (30 detik)
+#define MAX_PERIOD     60000   // Skala 1 menit untuk konversi CPM
+#define SEND_INTERVAL  5000    // Interval kirim via LoRa (5 detik)
 
 DHT dht(DHTPIN, DHTTYPE);
 
-// Variabel kalkulasi radiasi GM Kit
+// Variabel data radiasi GM Kit
 volatile unsigned long counts = 0;
 unsigned long previousMillis  = 0;
 unsigned long lastSendTime    = 0;
 unsigned int multiplier;
+double doseRate               = 0.0;
 
-double rerataCPM;
-int currentCPM = 0;
-double doseRate = 0.0;
-double pencacahanArray[100];
-
-// Interrupt Service Routine (ISR) untuk mencacah pulsa GM Kit
+// Interrupt Service Routine (ISR) GM Kit
 void IRAM_ATTR impulse() {
   counts++;
 }
 
 // Konversi CPM ke laju dosis (uSv/jam)
 double Sieverts(double cpm) {
-  // Faktor kalibrasi standar tabung GM J305 / M4011
   return cpm * 0.00571;
 }
 
-// Pembulatan 2 desimal
 double round2(double value) {
   return (int)(value * 100 + 0.5) / 100.0;
 }
@@ -79,92 +72,68 @@ void setup() {
   Serial.begin(115200);
   multiplier = MAX_PERIOD / LOG_PERIOD;
 
-  // Inisialisasi Sensor & Interrupt GM Kit
   dht.begin();
   pinMode(DHTPIN, INPUT);
   pinMode(GM_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GM_PIN), impulse, FALLING);
 
-  // Sambungkan ke WiFi
-  Serial.println("\n[ESP32 Outdoor Monitor]");
-  Serial.print("Menghubungkan ke WiFi: ");
-  Serial.println(WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // Inisialisasi Modul LoRa Transceiver
+  Serial.println("\n[ESP32 Outdoor Monitor via LoRa]");
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  if (!LoRa.begin(LORA_BAND)) {
+    Serial.println("Error: Modul LoRa gagal diinisialisasi! Periksa sambungan SPI.");
+    while (true) delay(1000);
   }
 
-  Serial.println("\nWiFi Berhasil Terhubung!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  // Pengaturan parameter LoRa untuk penetrasi dinding tebal
+  LoRa.setTxPower(20);          // Daya transmisi maksimal (20 dBm)
+  LoRa.setSpreadingFactor(10);  // SF10: Jangkauan jauh dan tembus halangan
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+
+  Serial.println("Modul LoRa Outdoor Siap Memancar!");
 }
 
 void loop() {
-  // 1. Pembacaan Sensor Lingkungan DHT22
+  // 1. Baca Sensor Suhu & Kelembapan DHT22
   double kelembaban = dht.readHumidity();
   double suhu       = dht.readTemperature();
 
   if (isnan(kelembaban) || isnan(suhu)) {
-    Serial.println("Peringatan: Gagal membaca sensor DHT22. Periksa kabel!");
-    delay(1000);
-    return;
+    kelembaban = 0.0;
+    suhu       = 0.0;
   }
 
-  // 2. Kalkulasi CPM & Laju Dosis Radiasi GM Kit Tiap 30 Detik
+  // 2. Kalkulasi Laju Dosis Radiasi GM Kit
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis > LOG_PERIOD) {
     previousMillis = currentMillis;
-    pencacahanArray[currentCPM] = counts * multiplier;
-    doseRate = Sieverts(pencacahanArray[currentCPM]);
+    doseRate = Sieverts(counts * multiplier);
     counts = 0;
-
-    // Moving average untuk stabilitas
-    rerataCPM = 0;
-    for (int x = 0; x <= currentCPM; x++) {
-      rerataCPM += pencacahanArray[x];
-    }
-    rerataCPM /= (currentCPM + 1);
-
-    Serial.printf("[UPDATE GM KIT] CPM: %.1f | Laju Dosis: %.4f uSv/h\n", rerataCPM, doseRate);
-    currentCPM++;
-    if (currentCPM >= 100) currentCPM = 0;
   }
 
-  // 3. Pengiriman Data ke Server Laravel via HTTP POST
+  // 3. Kirim Paket Data ke Master Display melalui LoRa
   if ((millis() - lastSendTime) > SEND_INTERVAL) {
     lastSendTime = millis();
 
-    if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
-      http.begin(SERVER_POST);
-      http.addHeader("Content-Type", "application/json");
-      http.addHeader("Api-Key", API_KEY);
+    // Susun payload JSON
+    StaticJsonDocument<200> doc;
+    doc["node"]       = "OUTDOOR";
+    doc["cps"]        = counts;
+    doc["usvh"]       = round2(doseRate);
+    doc["suhu"]       = round2(suhu);
+    doc["kelembapan"] = round2(kelembaban);
 
-      // Siapkan payload JSON
-      StaticJsonDocument<256> doc;
-      doc["cps"]        = counts;
-      doc["usvh"]       = round2(doseRate);
-      doc["suhu"]       = round2(suhu);
-      doc["kelembapan"] = round2(kelembaban);
+    String payload;
+    serializeJson(doc, payload);
 
-      String requestBody;
-      serializeJson(doc, requestBody);
+    // Pancarkan paket LoRa
+    LoRa.beginPacket();
+    LoRa.print(payload);
+    LoRa.endPacket();
 
-      int httpResponseCode = http.POST(requestBody);
-
-      if (httpResponseCode > 0) {
-        Serial.printf("[POST OUTDOOR] HTTP %d | Dosis: %.2f uSv/h | Suhu: %.1f C | RH: %.1f %%\n",
-                      httpResponseCode, doseRate, suhu, kelembaban);
-      } else {
-        Serial.printf("[POST OUTDOOR ERROR] %s\n", http.errorToString(httpResponseCode).c_str());
-      }
-
-      http.end();
-    } else {
-      Serial.println("[WIFI] Koneksi terputus, mencoba menghubungkan ulang...");
-      WiFi.reconnect();
-    }
+    Serial.printf("[LORA TX OUTDOOR] Dosis: %.2f uSv/h | Suhu: %.1f C | RH: %.1f %% -> Terkirim ke Master\n",
+                  doseRate, suhu, kelembaban);
   }
 }
